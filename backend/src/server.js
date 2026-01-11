@@ -1,0 +1,125 @@
+/**
+ * Main server file for CMS Backend API
+ */
+require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const compression = require('compression');
+
+const { connectDatabase } = require('./config/database');
+const { connectRedis } = require('./config/redis');
+const logger = require('./config/logger');
+
+// Import routes
+const authRoutes = require('./routes/auth');
+const adminRoutes = require('./routes/admin');
+const catalogRoutes = require('./routes/catalog');
+const healthRoutes = require('./routes/health');
+
+// Import middleware
+const errorHandler = require('./middleware/errorHandler');
+const requestLogger = require('./middleware/requestLogger');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+/**
+ * Initialize server
+ */
+async function startServer() {
+  try {
+    // Connect to databases
+    await connectDatabase();
+    
+    // Try to connect to Redis (optional)
+    try {
+      await connectRedis();
+    } catch (error) {
+      logger.warn('Starting server without Redis (caching disabled)');
+    }
+
+    // Security middleware
+    app.use(helmet());
+    app.use(cors({
+      origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+      credentials: true
+    }));
+
+    // General middleware
+    app.use(compression());
+    
+    // JSON parsing with error handling
+    app.use(express.json({ 
+      limit: '10mb',
+      verify: (req, res, buf) => {
+        try {
+          JSON.parse(buf);
+        } catch (e) {
+          res.status(400).json({
+            message: 'Invalid JSON format',
+            error: e.message
+          });
+          return;
+        }
+      }
+    }));
+    app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+    // Logging middleware
+    app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
+    app.use(requestLogger);
+
+    // Routes
+    app.use('/health', healthRoutes);
+    app.use('/api/auth', authRoutes);
+    app.use('/api/admin', adminRoutes);
+    app.use('/catalog', catalogRoutes);
+
+    // Error handling
+    app.use(errorHandler);
+
+    // Start server with port conflict handling
+    const server = app.listen(PORT, () => {
+      logger.info(`Server running on port ${PORT}`, {
+        environment: process.env.NODE_ENV,
+        port: PORT
+      });
+    });
+
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        logger.warn(`Port ${PORT} is busy, trying port ${PORT + 1}`);
+        const newPort = PORT + 1;
+        app.listen(newPort, () => {
+          logger.info(`Server running on port ${newPort}`, {
+            environment: process.env.NODE_ENV,
+            port: newPort
+          });
+        });
+      } else {
+        logger.error('Server error:', err);
+        process.exit(1);
+      }
+    });
+
+  } catch (error) {
+    logger.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT received, shutting down gracefully');
+  process.exit(0);
+});
+
+startServer();
